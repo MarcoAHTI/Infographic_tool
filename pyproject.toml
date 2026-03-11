@@ -1,0 +1,39 @@
+[project]
+name = "infographic-orchestrator"
+version = "0.1.0"
+description = "Multi-agent Python application for transforming PDFs into branded infographics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Marco Griep", email = "marco@ahti.nl"}]
+keywords = ["infographic", "canva", "mistral", "langgraph"]
+
+dependencies = [
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "langgraph>=0.2.0",
+    "langchain-core>=0.2.0",
+    "mistralai>=0.0.7",
+    "httpx>=0.27.0",
+    "aiofiles>=23.0.0",
+    "pypdf>=4.0.0",
+    "streamlit>=1.38.0",
+    "Pillow>=10.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.1.0",
+    "black>=23.0.0",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py310", "py311", "py312", "py313", "py314"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+extend-select = ["E", "W", "F", "I", "C", "B"]

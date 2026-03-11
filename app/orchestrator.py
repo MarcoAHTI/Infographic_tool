@@ -30,6 +30,7 @@ from langgraph.graph import END, StateGraph
 from app import brand_config
 from app.agents import brand_critic, content_architect, design_liaison
 from app.models import InfographicContent, QAResult
+from app.services.canva_service import CanvaAuthError
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ async def node_create_design(state: OrchestratorState) -> OrchestratorState:
         image_bytes = await design_liaison.run(content)
         state["image_bytes"] = image_bytes
         _log(state, f"✅ [Design Liaison] Design exported ({len(image_bytes):,} bytes).")
-    except (ValueError, KeyError, httpx.HTTPError, TimeoutError, RuntimeError) as exc:
+    except (ValueError, KeyError, httpx.HTTPError, TimeoutError, RuntimeError, CanvaAuthError) as exc:
         state["error"] = f"Design creation failed: {exc}"
         _log(state, f"❌ [Design Liaison] Error: {exc}")
     return state
@@ -140,6 +141,10 @@ def node_check_qa(state: OrchestratorState) -> str:
     retry_count = state.get("retry_count", 0)
 
     if qa.get("passed") or state.get("final_image_bytes"):
+        return "end"
+
+    # Do not retry when design generation already failed with an explicit error.
+    if state.get("error", "").startswith("Design creation failed:"):
         return "end"
 
     if retry_count < brand_config.MAX_DESIGN_RETRIES - 1:

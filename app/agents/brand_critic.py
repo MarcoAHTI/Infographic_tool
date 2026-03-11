@@ -4,7 +4,7 @@ Brand Critic Agent (Agent 3).
 Responsibilities
 ----------------
 - Accept the exported infographic image bytes.
-- Send the image to Gemini Vision for quality assurance.
+- Send the image to Mistral Vision for quality assurance.
 - Check: logo visibility, colour correctness, and text-overlap absence.
 - Return a validated :class:`~app.models.QAResult` model.
 - If QA fails, signal the orchestrator to re-run the Design Liaison.
@@ -16,7 +16,7 @@ from typing import Any, Dict
 
 from app import brand_config
 from app.models import QAResult
-from app.services import gemini_service
+from app.services import mistral_service
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ async def run(image_bytes: bytes) -> QAResult:
         logo_placement=brand_config.LOGO_PLACEMENT,
     )
 
-    raw: Dict[str, Any] = await gemini_service.analyze_image_json(
+    raw: Dict[str, Any] = await mistral_service.analyze_image_json(
         image_bytes=image_bytes,
         prompt=prompt,
         mime_type="image/png",

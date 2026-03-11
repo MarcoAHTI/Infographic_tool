@@ -4,7 +4,7 @@ Content Architect Agent (Agent 1).
 Responsibilities
 ----------------
 - Accept raw document text (extracted from a PDF by the caller).
-- Call the Gemini text API with a structured-extraction prompt.
+- Call the Mistral text API with a structured-extraction prompt.
 - Return a validated :class:`~app.models.InfographicContent` Pydantic model.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ import logging
 from typing import Any, Dict
 
 from app.models import InfographicContent
-from app.services import gemini_service
+from app.services import mistral_service
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ async def run(document_text: str) -> InfographicContent:
     logger.info("[ContentArchitect] Extracting structured content from document…")
     prompt = EXTRACTION_PROMPT_TEMPLATE.format(document_text=document_text[:12000])
 
-    raw: Dict[str, Any] = await gemini_service.extract_structured_json(prompt)
+    raw: Dict[str, Any] = await mistral_service.extract_structured_json(prompt)
 
     # Validate and coerce via Pydantic
     content = InfographicContent(**raw)

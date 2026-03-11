@@ -16,9 +16,11 @@ import json
 import logging
 import os
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, urlparse
 
 import streamlit as st
 
@@ -34,9 +36,15 @@ load_dotenv(_PROJECT_ROOT / ".env")
 
 from app import brand_config  # noqa: E402
 from app.orchestrator import run_pipeline  # noqa: E402
+from app.services import canva_service  # noqa: E402
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# Keep pending PKCE pairs server-side so OAuth callback still works
+# even if Streamlit session_state is reset/recreated.
+_PKCE_PENDING: Dict[str, tuple[str, float]] = {}
+_PKCE_TTL_SECONDS = 15 * 60
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -76,6 +84,173 @@ def run_async(coro):
     return loop.run_until_complete(coro)
 
 
+def _qp_value(value: Any) -> str:
+    """Normalize Streamlit query param values to a single string."""
+    if isinstance(value, list):
+        return value[0] if value else ""
+    return value or ""
+
+
+def _persist_env_updates(updates: Dict[str, str]) -> None:
+    """Persist selected key/value pairs into the project's .env file."""
+    env_path = _PROJECT_ROOT / ".env"
+    existing_lines: list[str] = []
+    if env_path.exists():
+        existing_lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    remaining = dict(updates)
+    new_lines: list[str] = []
+    for line in existing_lines:
+        if "=" in line and not line.strip().startswith("#"):
+            key, _ = line.split("=", 1)
+            key = key.strip()
+            if key in remaining:
+                new_lines.append(f"{key}={remaining.pop(key)}")
+                continue
+        new_lines.append(line)
+
+    for key, value in remaining.items():
+        new_lines.append(f"{key}={value}")
+
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+def _extract_code_state_from_callback(callback_url: str) -> tuple[str, str]:
+    """Extract OAuth code and state from a callback URL string."""
+    parsed = urlparse(callback_url)
+    params = parse_qs(parsed.query)
+    code = params.get("code", [""])[0]
+    state = params.get("state", [""])[0]
+    return code, state
+
+
+def render_canva_auth() -> None:
+    """Render Canva OAuth connect flow and keep tokens in process memory."""
+    st.header("Step 0 – Connect Canva (OAuth)")
+
+    if "canva_oauth_state" not in st.session_state:
+        st.session_state["canva_oauth_state"] = ""
+    if "canva_code_verifier" not in st.session_state:
+        st.session_state["canva_code_verifier"] = ""
+
+    has_token = bool(os.getenv("CANVA_ACCESS_TOKEN") or os.getenv("CANVA_REFRESH_TOKEN"))
+    if has_token:
+        st.success("✅ Canva token configuration detected.")
+    else:
+        st.warning("Canva not connected yet. Authorize once to continue.")
+
+    redirect_uri = os.getenv("CANVA_REDIRECT_URI", "").strip()
+    if redirect_uri:
+        st.caption(f"Configured redirect URI: {redirect_uri}")
+        if "localhost" not in redirect_uri and "127.0.0.1" not in redirect_uri:
+            st.warning(
+                "Your redirect URI is not local. If this app runs locally, update CANVA_REDIRECT_URI "
+                "to http://127.0.0.1:8501/ (and register it in Canva Developer Portal)."
+            )
+
+    if st.button("🔐 Generate Canva Authorization URL", use_container_width=True):
+        code_verifier, code_challenge = canva_service.generate_pkce_pair()
+        state = canva_service.generate_state()
+        auth_url = canva_service.build_authorization_url(
+            code_challenge=code_challenge,
+            state=state,
+            redirect_uri=redirect_uri or None,
+        )
+        st.session_state["canva_code_verifier"] = code_verifier
+        st.session_state["canva_oauth_state"] = state
+        st.session_state["canva_auth_url"] = auth_url
+        _PKCE_PENDING[state] = (code_verifier, time.time())
+
+    auth_url = st.session_state.get("canva_auth_url")
+    if auth_url:
+        st.markdown(f"Open this authorization URL: [Authorize in Canva]({auth_url})")
+
+    st.caption("If redirect query params do not return to this page, paste callback URL below.")
+    callback_url = st.text_input(
+        "Manual callback URL (optional)",
+        value="",
+        placeholder="https://.../canva_auth?code=...&state=...",
+    )
+
+    query_params = st.query_params
+    auth_code = _qp_value(query_params.get("code"))
+    returned_state = _qp_value(query_params.get("state"))
+
+    if callback_url and (not auth_code or not returned_state):
+        manual_code, manual_state = _extract_code_state_from_callback(callback_url)
+        auth_code = auth_code or manual_code
+        returned_state = returned_state or manual_state
+
+    if auth_code:
+        # Drop expired pending states.
+        now = time.time()
+        expired = [k for k, (_, ts) in _PKCE_PENDING.items() if now - ts > _PKCE_TTL_SECONDS]
+        for k in expired:
+            _PKCE_PENDING.pop(k, None)
+
+        expected_state = st.session_state.get("canva_oauth_state", "")
+        if not returned_state:
+            st.error("OAuth callback is missing the state parameter. Please retry authorization.")
+            return
+
+        # Prefer session verifier if state matches; otherwise fallback to server-side state cache.
+        verifier = ""
+        session_verifier = st.session_state.get("canva_code_verifier", "")
+        if expected_state and returned_state == expected_state and session_verifier:
+            verifier = session_verifier
+        elif returned_state in _PKCE_PENDING:
+            verifier = _PKCE_PENDING[returned_state][0]
+
+        if not verifier:
+            st.error("Missing code_verifier in session. Click Generate URL and retry.")
+            if st.button("Reset OAuth Callback State", key="reset_oauth_state"):
+                st.session_state["canva_oauth_state"] = ""
+                st.session_state["canva_code_verifier"] = ""
+                st.query_params.clear()
+                st.rerun()
+            return
+
+        with st.spinner("Exchanging authorization code for tokens…"):
+            try:
+                token_data = run_async(
+                    canva_service.exchange_authorization_code(
+                        code=auth_code,
+                        code_verifier=verifier,
+                        redirect_uri=redirect_uri or None,
+                    )
+                )
+                access_token = token_data.get("access_token", "")
+                refresh_token = token_data.get("refresh_token", "")
+                expires_in = token_data.get("expires_in")
+                canva_service.set_tokens(
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    expires_in=expires_in,
+                )
+                os.environ["CANVA_ACCESS_TOKEN"] = access_token
+                if refresh_token:
+                    os.environ["CANVA_REFRESH_TOKEN"] = refresh_token
+
+                to_persist: Dict[str, str] = {"CANVA_ACCESS_TOKEN": access_token}
+                if refresh_token:
+                    to_persist["CANVA_REFRESH_TOKEN"] = refresh_token
+                _persist_env_updates(to_persist)
+
+                _PKCE_PENDING.pop(returned_state, None)
+                st.session_state["canva_oauth_state"] = ""
+                st.session_state["canva_code_verifier"] = ""
+
+                st.success("✅ Canva authorization completed for this app session.")
+                if refresh_token:
+                    st.info(
+                        "Refresh token saved to .env. Future runs should not require re-authorization."
+                    )
+                st.query_params.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Canva OAuth exchange failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -86,6 +261,8 @@ def main() -> None:
         "Upload a PDF report and let the multi-agent system turn it into a "
         "fully branded infographic."
     )
+
+    render_canva_auth()
 
     # ── Sidebar: brand settings overview ──────────────────────────────────
     with st.sidebar:

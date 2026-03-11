@@ -1,5 +1,5 @@
 """
-Async wrapper around the Google Gemini API.
+Async wrapper around the Mistral AI API.
 
 Supports:
   - Text generation from a prompt string.
@@ -9,51 +9,49 @@ Supports:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 from typing import Any, Dict, Optional
 
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
+from mistralai.client import Mistral
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Model identifiers (configurable via environment variables)
-# Default to *-lite variants – cheaper and with separate free-tier quotas.
-# Override via GEMINI_TEXT_MODEL / GEMINI_VISION_MODEL env vars if needed.
 # ---------------------------------------------------------------------------
-TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.0-flash-lite")
-VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash-lite")
+TEXT_MODEL = os.getenv("MISTRAL_TEXT_MODEL", "mistral-large-latest")
+VISION_MODEL = os.getenv("MISTRAL_VISION_MODEL", "pixtral-12b-2409")
 
 # ---------------------------------------------------------------------------
-# Retry settings for 429 (quota / rate-limit) errors
+# Retry settings for rate-limit errors
 # ---------------------------------------------------------------------------
-MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
-RETRY_BASE_DELAY = float(os.getenv("GEMINI_RETRY_DELAY", "15"))  # seconds
+MAX_RETRIES = int(os.getenv("MISTRAL_MAX_RETRIES", "3"))
+RETRY_BASE_DELAY = float(os.getenv("MISTRAL_RETRY_DELAY", "15"))  # seconds
 
 
-def _get_client() -> None:
-    """Configure the Gemini SDK with the API key from the environment."""
-    api_key = os.getenv("GEMINI_API_KEY")
+def _get_client() -> Mistral:
+    """Get or create the Mistral API client."""
+    api_key = os.getenv("MISTRAL_API_KEY")
     if not api_key:
         raise EnvironmentError(
-            "GEMINI_API_KEY is not set. Add it to your .env file or environment."
+            "MISTRAL_API_KEY is not set. Add it to your .env file or environment."
         )
-    genai.configure(api_key=api_key)
+    return Mistral(api_key=api_key)
 
 
 async def _call_with_retry(fn, *args, **kwargs):
-    """Call *fn* with automatic retry on 429 rate-limit errors."""
+    """Call *fn* with automatic retry on rate-limit errors."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
-            if "429" in str(exc) and attempt < MAX_RETRIES:
+            if ("429" in str(exc) or "rate" in str(exc).lower()) and attempt < MAX_RETRIES:
                 delay = RETRY_BASE_DELAY * attempt
                 logger.warning(
-                    "Rate-limited (429). Retrying in %.0fs (attempt %d/%d)…",
+                    "Rate-limited. Retrying in %.0fs (attempt %d/%d)…",
                     delay, attempt, MAX_RETRIES,
                 )
                 await asyncio.sleep(delay)
@@ -63,7 +61,7 @@ async def _call_with_retry(fn, *args, **kwargs):
 
 async def generate_text(prompt: str, temperature: float = 0.4) -> str:
     """
-    Generate a text response from Gemini.
+    Generate a text response from Mistral.
 
     Parameters
     ----------
@@ -77,14 +75,17 @@ async def generate_text(prompt: str, temperature: float = 0.4) -> str:
     str
         The model's text response.
     """
-    _get_client()
-    model = genai.GenerativeModel(TEXT_MODEL)
-    response = await _call_with_retry(
-        model.generate_content,
-        prompt,
-        generation_config=GenerationConfig(temperature=temperature),
-    )
-    return response.text
+    client = _get_client()
+
+    def _call():
+        response = client.chat.complete(
+            model=TEXT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+        )
+        return response.choices[0].message.content
+
+    return await _call_with_retry(_call)
 
 
 async def extract_structured_json(
@@ -92,7 +93,7 @@ async def extract_structured_json(
     temperature: float = 0.2,
 ) -> Dict[str, Any]:
     """
-    Ask Gemini to return a JSON object and parse the response.
+    Ask Mistral to return a JSON object and parse the response.
 
     The prompt should instruct the model to respond **only** with valid JSON.
 
@@ -113,27 +114,30 @@ async def extract_structured_json(
     ValueError
         If the model response cannot be parsed as JSON.
     """
-    _get_client()
-    model = genai.GenerativeModel(TEXT_MODEL)
-    response = await _call_with_retry(
-        model.generate_content,
-        prompt,
-        generation_config=GenerationConfig(
+    client = _get_client()
+
+    def _call():
+        response = client.chat.complete(
+            model=TEXT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
-            response_mime_type="application/json",
-        ),
-    )
-    text = response.text.strip()
+        )
+        return response.choices[0].message.content
+
+    text = await _call_with_retry(_call)
+    text = text.strip()
+
     # Strip markdown code fences if present
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
         text = text.strip()
+
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Gemini returned non-JSON output: {text!r}") from exc
+        raise ValueError(f"Mistral returned non-JSON output: {text!r}") from exc
 
 
 async def analyze_image(
@@ -143,7 +147,7 @@ async def analyze_image(
     temperature: float = 0.2,
 ) -> str:
     """
-    Send an image to Gemini Vision and return the model's textual analysis.
+    Send an image to Mistral Vision and return the model's textual analysis.
 
     Parameters
     ----------
@@ -152,7 +156,7 @@ async def analyze_image(
     prompt:
         Instruction for the vision model (e.g., QA checklist questions).
     mime_type:
-        MIME type of the image.
+        MIME type of the image (e.g., "image/png", "image/jpeg").
     temperature:
         Sampling temperature.
 
@@ -161,15 +165,33 @@ async def analyze_image(
     str
         The model's description / analysis of the image.
     """
-    _get_client()
-    model = genai.GenerativeModel(VISION_MODEL)
-    image_part = {"mime_type": mime_type, "data": image_bytes}
-    response = await _call_with_retry(
-        model.generate_content,
-        [prompt, image_part],
-        generation_config=GenerationConfig(temperature=temperature),
-    )
-    return response.text
+    client = _get_client()
+
+    # Encode image as base64
+    image_base64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    def _call():
+        response = client.chat.complete(
+            model=VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{image_base64}"
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=temperature,
+        )
+        return response.choices[0].message.content
+
+    return await _call_with_retry(_call)
 
 
 async def analyze_image_json(
@@ -179,7 +201,7 @@ async def analyze_image_json(
     temperature: float = 0.2,
 ) -> Dict[str, Any]:
     """
-    Send an image to Gemini Vision and parse the JSON response.
+    Send an image to Mistral Vision and parse the JSON response.
 
     Parameters
     ----------
@@ -197,24 +219,42 @@ async def analyze_image_json(
     dict
         Parsed JSON from the model.
     """
-    _get_client()
-    model = genai.GenerativeModel(VISION_MODEL)
-    image_part = {"mime_type": mime_type, "data": image_bytes}
-    response = await _call_with_retry(
-        model.generate_content,
-        [prompt, image_part],
-        generation_config=GenerationConfig(
+    client = _get_client()
+
+    # Encode image as base64
+    image_base64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    def _call():
+        response = client.chat.complete(
+            model=VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{image_base64}"
+                            },
+                        },
+                    ],
+                }
+            ],
             temperature=temperature,
-            response_mime_type="application/json",
-        ),
-    )
-    text = response.text.strip()
+        )
+        return response.choices[0].message.content
+
+    text = await _call_with_retry(_call)
+    text = text.strip()
+
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
         text = text.strip()
+
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Gemini Vision returned non-JSON output: {text!r}") from exc
+        raise ValueError(f"Mistral Vision returned non-JSON output: {text!r}") from exc
