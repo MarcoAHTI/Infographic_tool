@@ -176,26 +176,37 @@ async def get_access_token() -> str:
     """
     global _cached_refresh_token
 
+    logger.info("get_access_token() called")
+    
     # Reuse cached token while still valid.
     if _cached_access_token and (_cached_token_expiry_epoch == 0.0 or time.time() < _cached_token_expiry_epoch):
+        logger.info("Using cached access token (still valid)")
         return _cached_access_token
 
     # Prefer an already-issued token from PKCE flow if available.
     static_access_token = os.getenv("CANVA_ACCESS_TOKEN", "").strip()
     if static_access_token:
+        logger.info("Loading access token from CANVA_ACCESS_TOKEN environment variable (length: %d)", len(static_access_token))
+        if not static_access_token.startswith("ey"):
+            logger.warning("⚠️ Token does not look like a JWT (should start with 'ey')")
         set_tokens(access_token=static_access_token)
         return static_access_token
 
+    logger.info("No cached or static access token found, attempting refresh token grant")
+    
     refresh_token = _cached_refresh_token or os.getenv("CANVA_REFRESH_TOKEN", "").strip()
     client_id, client_secret = _get_credentials()
 
     if not refresh_token:
-        raise CanvaAuthError(
+        msg = (
             "No CANVA_ACCESS_TOKEN or CANVA_REFRESH_TOKEN configured. "
             "Your Canva app is using OAuth Authorization Code + PKCE; run the auth flow "
             "to obtain tokens and store them in .env."
         )
+        logger.error(msg)
+        raise CanvaAuthError(msg)
 
+    logger.info("Attempting to refresh token using refresh_token (length: %d)", len(refresh_token))
     async with httpx.AsyncClient() as client:
         response = await client.post(
             CANVA_AUTH_URL,
@@ -212,19 +223,22 @@ async def get_access_token() -> str:
                 details = response.json()
             except Exception:
                 details = response.text
-            raise CanvaAuthError(
-                f"Canva token request failed ({response.status_code}): {details}"
-            )
+            msg = f"Canva token request failed ({response.status_code}): {details}"
+            logger.error(msg)
+            raise CanvaAuthError(msg)
 
         data = response.json()
         access_token = data.get("access_token")
-        refresh_token = data.get("refresh_token")
+        refresh_token_new = data.get("refresh_token")
         expires_in = data.get("expires_in")
         if not access_token:
-            raise CanvaAuthError("Canva token response did not include an access_token.")
+            msg = "Canva token response did not include an access_token."
+            logger.error(msg)
+            raise CanvaAuthError(msg)
+        logger.info("Successfully refreshed token (expires in %d seconds)", expires_in or 0)
         set_tokens(
             access_token=access_token,
-            refresh_token=refresh_token,
+            refresh_token=refresh_token_new,
             expires_in=expires_in,
         )
         return access_token
@@ -289,6 +303,14 @@ async def create_design_from_template(
         },
     }
 
+    logger.info(
+        "Submitting autofill request: template=%s, headline=%s, data_fields=%d",
+        brand_template_id,
+        content.get("headline", "")[:30],
+        len(data_fields),
+    )
+    logger.debug("Full autofill payload: %s", payload)
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{CANVA_API_BASE}/autofills",
@@ -299,11 +321,23 @@ async def create_design_from_template(
             },
             timeout=60,
         )
-        response.raise_for_status()
+        
+        if response.status_code >= 400:
+            try:
+                error_details = response.json()
+            except Exception:
+                error_details = response.text
+            logger.error(
+                "Canva autofill request failed (%d): %s",
+                response.status_code,
+                error_details,
+            )
+            response.raise_for_status()
+        
         data = response.json()
         # The async autofill job ID is returned; we poll for the design ID
         job_id: str = data.get("job", {}).get("id") or data.get("id", "")
-        logger.info("Canva autofill job created: %s", job_id)
+        logger.info("Canva autofill job created successfully: %s", job_id)
         return job_id
 
 

@@ -41,10 +41,42 @@ from app.services import canva_service  # noqa: E402
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Keep pending PKCE pairs server-side so OAuth callback still works
-# even if Streamlit session_state is reset/recreated.
-_PKCE_PENDING: Dict[str, tuple[str, float]] = {}
+# Keep pending PKCE pairs persistent across app restarts by storing in a file.
+# This ensures OAuth callback still works even if the app restarts.
 _PKCE_TTL_SECONDS = 15 * 60
+_PKCE_CACHE_FILE = _PROJECT_ROOT / ".pkce_cache"
+
+
+def _load_pkce_pending() -> Dict[str, tuple[str, float]]:
+    """Load PKCE pending states from disk, cleanup expired entries."""
+    if not _PKCE_CACHE_FILE.exists():
+        return {}
+    try:
+        import json
+        data = json.loads(_PKCE_CACHE_FILE.read_text(encoding="utf-8"))
+        # Convert stored format back to tuple
+        pending = {k: (v[0], float(v[1])) for k, v in data.items()}
+        # Clean up expired entries
+        now = time.time()
+        pending = {k: v for k, v in pending.items() if now - v[1] <= _PKCE_TTL_SECONDS}
+        return pending
+    except Exception as e:
+        logger.warning(f"Failed to load PKCE cache: {e}")
+        return {}
+
+
+def _save_pkce_pending(pending: Dict[str, tuple[str, float]]) -> None:
+    """Save PKCE pending states to disk."""
+    try:
+        import json
+        # Convert tuples to lists for JSON serialization
+        data = {k: list(v) for k, v in pending.items()}
+        _PKCE_CACHE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to save PKCE cache: {e}")
+
+
+_PKCE_PENDING: Dict[str, tuple[str, float]] = _load_pkce_pending()
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -133,15 +165,48 @@ def render_canva_auth() -> None:
     if "canva_code_verifier" not in st.session_state:
         st.session_state["canva_code_verifier"] = ""
 
-    has_token = bool(os.getenv("CANVA_ACCESS_TOKEN") or os.getenv("CANVA_REFRESH_TOKEN"))
-    if has_token:
-        st.success("✅ Canva token configuration detected.")
-    else:
-        st.warning("Canva not connected yet. Authorize once to continue.")
+    # ─── Token Status ─────────────────────────────────────────────────
+    access_token = os.getenv("CANVA_ACCESS_TOKEN", "").strip()
+    refresh_token = os.getenv("CANVA_REFRESH_TOKEN", "").strip()
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if access_token:
+            token_preview = access_token[:30] + "…" if len(access_token) > 30 else access_token
+            st.success(f"✅ **Access Token**\n`{token_preview}`")
+        else:
+            st.warning("⚠️ **Access Token**: Not found")
+    
+    with col2:
+        if refresh_token:
+            token_preview = refresh_token[:30] + "…" if len(refresh_token) > 30 else refresh_token
+            st.success(f"✅ **Refresh Token**\n`{token_preview}`")
+        else:
+            st.warning("⚠️ **Refresh Token**: Not found")
 
     redirect_uri = os.getenv("CANVA_REDIRECT_URI", "").strip()
     if redirect_uri:
-        st.caption(f"Configured redirect URI: {redirect_uri}")
+        st.caption(f"📍 Configured redirect URI: `{redirect_uri}`")
+        if "localhost" not in redirect_uri and "127.0.0.1" not in redirect_uri:
+            st.warning(
+                "Your redirect URI is not local. If this app runs locally, update CANVA_REDIRECT_URI "
+                "to http://127.0.0.1:8501/ (and register it in Canva Developer Portal)."
+            )
+
+    # ─── Brand Template ID Status ─────────────────────────────────────
+    template_id = os.getenv("CANVA_BRAND_TEMPLATE_ID", "").strip()
+    if template_id and template_id != "your_brand_template_id_here" and template_id != "PLACEHOLDER_TEMPLATE_ID":
+        st.success(f"✅ **Brand Template ID**: `{template_id[:20]}…`")
+    else:
+        st.error(
+            "❌ **Brand Template ID is missing or invalid** — Design creation will fail!\n\n"
+            "To find your template ID:\n"
+            "1. Go to [Canva Developer Console](https://www.canva.com/developers)\n"
+            "2. Find your brand template\n"
+            "3. Copy its ID\n"
+            "4. Update `.env`: `CANVA_BRAND_TEMPLATE_ID=<your_actual_id>`"
+        )
+
         if "localhost" not in redirect_uri and "127.0.0.1" not in redirect_uri:
             st.warning(
                 "Your redirect URI is not local. If this app runs locally, update CANVA_REDIRECT_URI "
@@ -160,6 +225,7 @@ def render_canva_auth() -> None:
         st.session_state["canva_oauth_state"] = state
         st.session_state["canva_auth_url"] = auth_url
         _PKCE_PENDING[state] = (code_verifier, time.time())
+        _save_pkce_pending(_PKCE_PENDING)  # Persist to disk
 
     auth_url = st.session_state.get("canva_auth_url")
     if auth_url:
@@ -187,6 +253,8 @@ def render_canva_auth() -> None:
         expired = [k for k, (_, ts) in _PKCE_PENDING.items() if now - ts > _PKCE_TTL_SECONDS]
         for k in expired:
             _PKCE_PENDING.pop(k, None)
+        if expired:
+            _save_pkce_pending(_PKCE_PENDING)  # Persist cleanup to disk
 
         expected_state = st.session_state.get("canva_oauth_state", "")
         if not returned_state:
@@ -237,6 +305,7 @@ def render_canva_auth() -> None:
                 _persist_env_updates(to_persist)
 
                 _PKCE_PENDING.pop(returned_state, None)
+                _save_pkce_pending(_PKCE_PENDING)  # Persist cleanup to disk
                 st.session_state["canva_oauth_state"] = ""
                 st.session_state["canva_code_verifier"] = ""
 
